@@ -1,0 +1,412 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project
+        run: |
+          mkdir -p UaLauncher UaLauncher/app UaLauncher/app/src/main UaLauncher/app/src/main/java/ua/home/launcher UaLauncher/app/src/main/res/drawable UaLauncher/app/src/main/res/values UaLauncher/app/src/main/res/xml UaLauncher/gradle/wrapper
+          cat > UaLauncher/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "ua.home.launcher"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "ua.home.launcher"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = (project.findProperty("vc") as String?)?.toInt() ?: 1
+                  versionName = "1.0"
+                  val repo = (project.findProperty("repo") as String?) ?: ""
+                  buildConfigField(
+                      "String", "UPDATE_URL",
+                      "\"" + (if (repo.isEmpty()) "" else "https://github.com/$repo/releases/download/latest/update.json") + "\""
+                  )
+              }
+              signingConfigs {
+                  create("fixed") {
+                      storeFile = rootProject.file("../ks/launcher.jks")
+                      storePassword = "launcher123"
+                      keyAlias = "launcher"
+                      keyPassword = "launcher123"
+                  }
+              }
+              buildTypes {
+                  debug { signingConfig = signingConfigs.getByName("fixed") }
+                  release { isMinifyEnabled = false; signingConfig = signingConfigs.getByName("fixed") }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true; buildConfig = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.animation:animation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF
+          cat > UaLauncher/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+              <application
+                  android:allowBackup="true"
+                  android:banner="@drawable/banner"
+                  android:icon="@drawable/banner"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:configChanges="orientation|screenSize|keyboard|keyboardHidden|uiMode|locale|layoutDirection">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+          cat > UaLauncher/app/src/main/java/ua/home/launcher/Apps.kt <<'EOF'
+          package ua.home.launcher
+
+          import android.content.Context
+          import android.content.Intent
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.core.graphics.drawable.toBitmap
+
+          class AppItem(val pkg: String, val label: String, val icon: ImageBitmap, val intent: Intent)
+
+          fun loadApps(ctx: Context): List<AppItem> {
+              val pm = ctx.packageManager
+              val found = listOf(Intent.CATEGORY_LEANBACK_LAUNCHER, Intent.CATEGORY_LAUNCHER).flatMap {
+                  pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(it), 0)
+              }
+              return found
+                  .distinctBy { it.activityInfo.packageName }
+                  .filter { it.activityInfo.packageName != ctx.packageName }
+                  .mapNotNull { r ->
+                      val pkg = r.activityInfo.packageName
+                      val i = pm.getLeanbackLaunchIntentForPackage(pkg) ?: pm.getLaunchIntentForPackage(pkg)
+                      if (i == null) null
+                      else AppItem(
+                          pkg,
+                          r.loadLabel(pm).toString(),
+                          r.loadIcon(pm).toBitmap(128, 128).asImageBitmap(),
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                  }
+                  .sortedBy { it.label.lowercase() }
+          }
+          EOF
+          cat > UaLauncher/app/src/main/java/ua/home/launcher/Cfg.kt <<'EOF'
+          package ua.home.launcher
+
+          import android.content.Context
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+
+          class Cfg(ctx: Context) {
+              private val p = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              var inited by mutableStateOf(p.getBoolean("inited", false))
+              var apps by mutableStateOf(p.getString("apps", "")!!.split(",").filter { it.isNotBlank() })
+              var city by mutableStateOf(p.getString("city", "Київ")!!)
+              var wallUrl by mutableStateOf(p.getString("wallUrl", "")!!)
+              var updateUrl by mutableStateOf(p.getString("updateUrl", BuildConfig.UPDATE_URL)!!)
+              var showGreeting by mutableStateOf(p.getBoolean("g", true))
+              var showDate by mutableStateOf(p.getBoolean("d", true))
+              var showWeather by mutableStateOf(p.getBoolean("w", true))
+              var clockSize by mutableStateOf(p.getInt("cs", 96))
+              var panelAlpha by mutableStateOf(p.getFloat("pa", 0.45f))
+
+              fun save() {
+                  p.edit()
+                      .putBoolean("inited", inited)
+                      .putString("apps", apps.joinToString(","))
+                      .putString("city", city)
+                      .putString("wallUrl", wallUrl)
+                      .putString("updateUrl", updateUrl)
+                      .putBoolean("g", showGreeting)
+                      .putBoolean("d", showDate)
+                      .putBoolean("w", showWeather)
+                      .putInt("cs", clockSize)
+                      .putFloat("pa", panelAlpha)
+                      .apply()
+              }
+          }
+          EOF
+          cat > UaLauncher/app/src/main/java/ua/home/launcher/MainActivity.kt <<'EOF'
+          package ua.home.launcher
+
+          import android.content.Context
+          import android.graphics.BitmapFactory
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.setContent
+          import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.grid.GridCells
+          import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+          import androidx.compose.foundation.lazy.grid.items
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.focus.onFocusChanged
+          import androidx.compose.ui.graphics.*
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme(colorScheme = darkColorScheme()) { Root() } }
+              }
+          }
+
+          private val UA = Locale("uk", "UA")
+          private val shadow = TextStyle(shadow = Shadow(Color.Black.copy(alpha = 0.55f), blurRadius = 10f))
+
+          fun loadWall(ctx: Context): ImageBitmap? {
+              val f = File(ctx.filesDir, "wall.jpg")
+              if (!f.exists()) return null
+              val b = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+              BitmapFactory.decodeFile(f.path, b)
+              var s = 1
+              while (b.outWidth / s > 2400) s *= 2
+              val o = BitmapFactory.Options().apply { inSampleSize = s }
+              return BitmapFactory.decodeFile(f.path, o)?.asImageBitmap()
+          }
+
+          fun greeting(h: Int) = when (h) {
+              in 5..11 -> "Доброго ранку"
+              in 12..17 -> "Добрий день"
+              in 18..22 -> "Добрий вечір"
+              else -> "Доброї ночі"
+          }
+
+          @Composable
+          fun Root() {
+              val ctx = LocalContext.current
+              val cfg = remember { Cfg(ctx) }
+              var screen by remember { mutableStateOf("home") }
+              var apps by remember { mutableStateOf(emptyList<AppItem>()) }
+              var wallVer by remember { mutableStateOf(0) }
+
+              LaunchedEffect(screen) {
+                  apps = withContext(Dispatchers.IO) { loadApps(ctx) }
+                  if (!cfg.inited && apps.isNotEmpty()) {
+                      cfg.apps = apps.take(7).map { it.pkg }
+                      cfg.inited = true
+                      cfg.save()
+                  }
+              }
+              val wall by produceState<ImageBitmap?>(null, wallVer) {
+                  value = withContext(Dispatchers.IO) { loadWall(ctx) }
+              }
+              BackHandler(enabled = screen != "home") { screen = "home" }
+
+              when (screen) {
+                  "home" -> Home(cfg, apps, wall, { screen = "all" }, { screen = "settings" })
+                  "all" -> AllApps(apps)
+                  else -> SettingsScreen(cfg, apps, { wallVer++ }, { screen = "home" })
+              }
+          }
+
+          @Composable
+          fun Btn(text: String, modifier: Modifier = Modifier, bg: Color = Color(0xFF232A33), onClick: () -> Unit) {
+              var f by remember { mutableStateOf(false) }
+              Box(
+                  modifier
+                      .onFocusChanged { f = it.hasFocus }
+                      .clip(RoundedCornerShape(16.dp))
+                      .background(if (f) Color(0xFF3B6FD4) else bg)
+                      .border(if (f) 2.dp else 0.dp, Color.White, RoundedCornerShape(16.dp))
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = 20.dp, vertical = 14.dp),
+                  contentAlignment = Alignment.CenterStart
+              ) { Text(text, color = Color.White, fontSize = 18.sp) }
+          }
+
+          @Composable
+          fun AppTile(item: AppItem, modifier: Modifier = Modifier, inner: Modifier = Modifier) {
+              val ctx = LocalContext.current
+              var focused by remember { mutableStateOf(false) }
+              val scale by animateFloatAsState(if (focused) 1.2f else 1f, label = "scale")
+              Box(modifier.size(72.dp).graphicsLayer { scaleX = scale; scaleY = scale }) {
+                  Image(
+                      item.icon, item.label,
+                      Modifier
+                          .fillMaxSize()
+                          .then(inner)
+                          .onFocusChanged { focused = it.hasFocus }
+                          .clip(RoundedCornerShape(18.dp))
+                          .border(if (focused) 3.dp else 0.dp, Color.White, RoundedCornerShape(18.dp))
+                          .clickable { runCatching { ctx.startActivity(item.intent) } }
+                  )
+                  if (focused) {
+                      Text(
+                          item.label, color = Color.White, fontSize = 15.sp, maxLines = 1,
+                          modifier = Modifier
+                              .align(Alignment.TopCenter)
+                              .wrapContentWidth(unbounded = true)
+                              .offset(y = (-42).dp)
+                              .background(Color(0xAA000000), RoundedCornerShape(10.dp))
+                              .padding(horizontal = 12.dp, vertical = 5.dp)
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun Home(cfg: Cfg, apps: List<AppItem>, wall: ImageBitmap?, onAll: () -> Unit, onSettings: () -> Unit) {
+              var now by remember { mutableStateOf(Date()) }
+              LaunchedEffect(Unit) { while (true) { now = Date(); delay(1000) } }
+              var weather by remember { mutableStateOf("Погода поки недоступна") }
+              LaunchedEffect(cfg.city) {
+                  while (true) {
+                      weather = withContext(Dispatchers.IO) { fetchWeather(cfg.city) } ?: "Погода поки недоступна"
+                      delay(30 * 60 * 1000L)
+                  }
+              }
+              val panel = cfg.apps.mapNotNull { p -> apps.find { it.pkg == p } }
+              val fr = remember { FocusRequester() }
+              LaunchedEffect(panel.size) { if (panel.isNotEmpty()) runCatching { fr.requestFocus() } }
+
+              val hour = Calendar.getInstance().apply { time = now }.get(Calendar.HOUR_OF_DAY)
+              val time = SimpleDateFormat("HH:mm", UA).format(now)
+              val date = SimpleDateFormat("EEEE, d MMMM", UA).format(now).replaceFirstChar { it.uppercase() }
+
+              Box(Modifier.fillMaxSize()) {
+                  if (wall != null) {
+                      Image(wall, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                  } else {
+                      Box(
+                          Modifier.fillMaxSize().background(
+                              Brush.verticalGradient(listOf(Color(0xFF2E6FD0), Color(0xFFF2A65A), Color(0xFF1F3B2A)))
+                          )
+                      )
+                  }
+                  Column(
+                      Modifier.align(Alignment.TopCenter).padding(top = 48.dp),
+                      horizontalAlignment = Alignment.CenterHorizontally
+                  ) {
+                      if (cfg.showGreeting) Text(greeting(hour), color = Color.White.copy(alpha = 0.9f), fontSize = 24.sp, style = shadow)
+                      Text(time, color = Color.White, fontSize = cfg.clockSize.sp, fontWeight = FontWeight.SemiBold, style = shadow)
+                      if (cfg.showDate) Text(date, color = Color.White.copy(alpha = 0.9f), fontSize = 22.sp, style = shadow)
+                      if (cfg.showWeather) Text(weather, color = Color.White.copy(alpha = 0.9f), fontSize = 20.sp, style = shadow)
+                  }
+                  Row(
+                      Modifier.align(Alignment.TopEnd).padding(32.dp),
+                      horizontalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      Btn("Усі застосунки", bg = Color(0x66000000), onClick = onAll)
+                      Btn("⚙", bg = Color(0x66000000), onClick = onSettings)
+                  }
+                  Row(
+                      Modifier
+                          .align(Alignment.BottomCenter)
+                          .padding(bottom = 56.dp)
+                          .background(Color.Black.copy(alpha = cfg.panelAlpha), RoundedCornerShape(32.dp))
+                          .padding(horizontal = 28.dp, vertical = 20.dp),
+                      horizontalArrangement = Arrangement.spacedBy(22.dp)
+                  ) {
+                      panel.forEachIndexed { i, a ->
+                          AppTile(a, inner = if (i == 0) Modifier.focusRequester(fr) else Modifier)
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun AllApps(apps: List<AppItem>) {
+              Box(Modifier.fillMaxSize().background(Color(0xFF101418))) {
+                  LazyVerticalGrid(
+                      GridCells.Adaptive(120.dp),
+                      contentPadding = PaddingValues(horizontal = 60.dp, vertical = 70.dp)
+                  ) {
+                      items(apps) { a -> Box(Modifier.padding(24.dp)) { AppTile(a) } }
+                  }
+              }
+          }
+
+          @Composable
+          fun SettingsScreen(cfg: Cfg, apps: List<AppItem>, onWall: () -> Unit, onBack: () -> Unit) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var status by remember { mutableStateOf("") }
+              fun yn(b: Boolean) = if (b) "так" else "ні"
+
+              LazyColumn(
+                  Modifier.fillMaxSize().background(Color(0xFF101418)).padding(horizontal = 80.dp),
+                  contentPadding = 
